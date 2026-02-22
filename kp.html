@@ -453,9 +453,35 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://unpkg.com/dexie/dist/dexie.js"></script>
 <script>
-    const residentDB = JSON.parse(localStorage.getItem('rbi_db')) || [];
+    // ── IndexedDB bridge: reads residents from the same Dexie DB as index.html ──
+    const _kpIDB = new Dexie('RBI_DB_2026');
+    _kpIDB.version(1).stores({ residents: 'id, last, hh_name', households: 'name' });
+
+    // In-memory resident cache — populated async on load, used synchronously in search
+    let _residentCache = [];
+
+    async function loadResidentCache() {
+        try {
+            _residentCache = await _kpIDB.residents.toArray();
+            if (_residentCache.length === 0) {
+                try { _residentCache = JSON.parse(localStorage.getItem('rbi_db')) || []; } catch(e) {}
+            }
+        } catch(e) {
+            try { _residentCache = JSON.parse(localStorage.getItem('rbi_db')) || []; } catch(e2) { _residentCache = []; }
+        }
+    }
+
+    // Synchronous getter — uses cache loaded on DOMContentLoaded
+    function getResidentDB() { return _residentCache; }
     const rbiSettings = JSON.parse(localStorage.getItem('rbi_settings')) || {};
+    const isCity = (rbiSettings.lguType || '').toUpperCase() === 'CITY';
+    function getKPHeader() {
+        const provLine = isCity ? '' : `${rbiSettings.province || '________'}<br>`;
+        const muniLabel = isCity ? 'City' : 'Municipality';
+        return `Republic of the Philippines<br>${provLine}${muniLabel} of ${rbiSettings.municipality || '________'}<br><strong>Barangay ${rbiSettings.barangay || '________'}</strong>`;
+    }
     let casesDB = JSON.parse(localStorage.getItem('kp_cases_v2')) || [];
     let luponDB = JSON.parse(localStorage.getItem('kp_lupon')) || [];
     let incidentDB = JSON.parse(localStorage.getItem('kp_incidents')) || [];
@@ -484,18 +510,26 @@
     function confirmCustomAlert() { if (window.customAlertCallback) window.customAlertCallback(); closeCustomAlert(); }
 
     function returnToRBIS() {
-        sessionStorage.removeItem('kp_authenticated');
         sessionStorage.setItem('rbis_bypass_security', 'true');
+        sessionStorage.setItem('kp_was_licensed', 'true');
         window.location.href = 'index.html';
     }
 
-    document.addEventListener("DOMContentLoaded", () => {
+    document.addEventListener("DOMContentLoaded", async () => {
+        // Load IndexedDB resident cache FIRST so autocomplete works immediately
+        await loadResidentCache();
         repairDatabase(); genCaseNo(); genIncidentNo();
         addParty('complainant'); addParty('respondent');
         addIncidentPerson();
         document.getElementById('nc-nature').addEventListener('change', function() {
             document.getElementById('div-reason').style.display = this.value === 'Confrontation' ? 'block' : 'none';
         });
+        // Show connected resident count in sidebar
+        const living = _residentCache.filter(r => !r.isDead);
+        const badge = document.createElement('div');
+        badge.style.cssText = 'padding:6px 24px 12px; font-size:0.72rem; color:rgba(255,255,255,0.4);';
+        badge.innerHTML = '<i class="fas fa-database me-1" style="color:#34d399;"></i> ' + living.length + ' residents linked';
+        document.querySelector('.sidebar').appendChild(badge);
     });
 
     function repairDatabase() {
@@ -507,6 +541,10 @@
             if (!c.settlements) { c.settlements = []; updated = true; }
             if (!c.reSummonCount) { c.reSummonCount = 0; updated = true; }
             if (!c.reNoticeCount) { c.reNoticeCount = 0; updated = true; }
+            if (!c.complainantAddrs) { c.complainantAddrs = c.complainants.map(()=>''); updated = true; }
+            if (!c.complainantContacts) { c.complainantContacts = c.complainants.map(()=>''); updated = true; }
+            if (!c.respondentAddrs) { c.respondentAddrs = c.respondents.map(()=>''); updated = true; }
+            if (!c.respondentContacts) { c.respondentContacts = c.respondents.map(()=>''); updated = true; }
         });
         if(updated) localStorage.setItem('kp_cases_v2', JSON.stringify(casesDB));
     }
@@ -544,7 +582,7 @@
         const id = `ir-person-${++incidentPersonCount}`;
         const div = document.createElement('div');
         div.className = 'party-row';
-        div.innerHTML = `<div style="position:relative; width:100%;"><input type="text" id="${id}" class="form-control" placeholder="Enter name..." autocomplete="off"></div>${container.children.length > 0 ? `<button class="remove-btn" onclick="this.parentElement.remove()"><i class="fas fa-times"></i></button>` : ''}`;
+        div.innerHTML = '<div style="position:relative; width:100%;"><input type="text" id="' + id + '" class="form-control" placeholder="Search or type resident name..." autocomplete="off" onkeyup="debouncedSearchResident(\'' + id + '\')"><div id="' + id + '-suggest" class="suggestion-box"></div></div>' + (container.children.length > 0 ? '<button class="remove-btn" onclick="this.parentElement.remove()"><i class="fas fa-times"></i></button>' : '');
         container.appendChild(div);
     }
 
@@ -578,7 +616,7 @@
         const searchTerm = document.getElementById('search-incident').value.toLowerCase();
         const tbody = document.getElementById('tbl-incident-blotter');
         const filtered = incidentDB.filter(i => i.irNo.toLowerCase().includes(searchTerm) || i.type.toLowerCase().includes(searchTerm) || i.location.toLowerCase().includes(searchTerm) || i.persons.some(p => p.toLowerCase().includes(searchTerm))).reverse();
-        tbody.innerHTML = filtered.map(i => `<tr><td class="fw-bold">${i.irNo}</td><td>${new Date(i.date).toLocaleDateString()}</td><td>${i.type}</td><td>${i.location}</td><td>${i.persons.slice(0,2).join(', ')}${i.persons.length>2?'...':''}}</td><td><button class="btn btn-sm btn-primary" onclick="viewIncidentDetail('${i.id}')">View</button> <button class="btn btn-sm btn-success" onclick="printIncident('${i.id}')">Print</button></td></tr>`).join('');
+        tbody.innerHTML = filtered.map(i => `<tr><td class="fw-bold">${i.irNo}</td><td>${new Date(i.date).toLocaleDateString()}</td><td>${i.type}</td><td>${i.location}</td><td>${i.persons.slice(0,2).join(', ')}${i.persons.length>2?'...':''}</td><td><button class="btn btn-sm btn-primary" onclick="viewIncidentDetail('${i.id}')">View</button> <button class="btn btn-sm btn-success" onclick="printIncident('${i.id}')">Print</button></td></tr>`).join('');
     }
 
     function viewIncidentDetail(id) {
@@ -594,8 +632,7 @@
     function printIncident(id) {
         const incident = incidentDB.find(i => i.id === id);
         if(!incident) return showAlert('Not found', 'error');
-        const provinceOrCity = rbiSettings.city ? `City of ${rbiSettings.city}` : `Province of ${rbiSettings.province || '________'}`;
-        const content = `<div style="text-align:center;margin-bottom:30px;">Republic of the Philippines<br>${provinceOrCity}<br>Municipality of ${rbiSettings.municipality||'________'}<br><strong>Barangay ${rbiSettings.barangay||'________'}</strong><br><br><strong>OFFICE OF THE LUPONG TAGAPAMAYAPA</strong></div><h3 style="text-align:center;text-decoration:underline;margin:30px 0;">INCIDENT REPORT</h3><table width="100%" style="margin-bottom:20px;"><tr><td width="30%"><strong>IR Number:</strong></td><td>${incident.irNo}</td></tr><tr><td><strong>Date:</strong></td><td>${new Date(incident.date).toLocaleDateString()}</td></tr><tr><td><strong>Time:</strong></td><td>${incident.time}</td></tr><tr><td><strong>Location:</strong></td><td>${incident.location}</td></tr><tr><td><strong>Type:</strong></td><td>${incident.type}</td></tr></table><p><strong>PERSONS INVOLVED:</strong></p><ul>${incident.persons.map(p=>`<li>${p}</li>`).join('')}</ul><p><strong>NARRATIVE:</strong></p><p style="text-align:justify;line-height:1.8;padding:15px;border:1px solid #ccc;background:#f9f9f9;white-space:pre-wrap;">${incident.narrative}</p><p><strong>Reported By:</strong> ${incident.reporter}</p><br><br><div style="float:right;text-align:center;width:250px;"><div style="border-bottom:1px solid black;margin-bottom:5px;"></div><strong>${getLuponChairman()}</strong><br>Punong Barangay / Lupon Chairman</div>`;
+        const content = `<div style="text-align:center;margin-bottom:30px;">${getKPHeader()}<br><br><strong>OFFICE OF THE LUPONG TAGAPAMAYAPA</strong></div><h3 style="text-align:center;text-decoration:underline;margin:30px 0;">INCIDENT REPORT</h3><table width="100%" style="margin-bottom:20px;"><tr><td width="30%"><strong>IR Number:</strong></td><td>${incident.irNo}</td></tr><tr><td><strong>Date:</strong></td><td>${new Date(incident.date).toLocaleDateString()}</td></tr><tr><td><strong>Time:</strong></td><td>${incident.time}</td></tr><tr><td><strong>Location:</strong></td><td>${incident.location}</td></tr><tr><td><strong>Type:</strong></td><td>${incident.type}</td></tr></table><p><strong>PERSONS INVOLVED:</strong></p><ul>${incident.persons.map(p=>`<li>${p}</li>`).join('')}</ul><p><strong>NARRATIVE:</strong></p><p style="text-align:justify;line-height:1.8;padding:15px;border:1px solid #ccc;background:#f9f9f9;white-space:pre-wrap;">${incident.narrative}</p><p><strong>Reported By:</strong> ${incident.reporter}</p><br><br><div style="float:right;text-align:center;width:250px;"><div style="border-bottom:1px solid black;margin-bottom:5px;"></div><strong>${getLuponChairman()}</strong><br>Punong Barangay / Lupon Chairman</div>`;
         const win = window.open('','','width=850,height=1100');
         win.document.write(`<html><head><title>IR</title><style>body{font-family:'Times New Roman',serif;padding:40px;line-height:1.5;}</style></head><body>${content}<script>window.onload=()=>window.print();<\/script></body></html>`);
         win.document.close();
@@ -605,23 +642,52 @@
 
     function addParty(type) {
         const container = document.getElementById(`list-${type}s`);
-        const id = `${type}-${type==='complainant'?++compCount:++respCount}`;
+        const num = type==='complainant' ? ++compCount : ++respCount;
+        const id = `${type}-${num}`;
+        const addrId = `${type}-addr-${num}`;
+        const contactId = `${type}-contact-${num}`;
+        const isFirst = container.children.length === 0;
         const div = document.createElement('div');
-        div.className = 'party-row';
-        div.innerHTML = `<div style="position:relative;width:100%;"><input type="text" id="${id}" class="form-control ${type}-input" placeholder="Search Resident..." onkeyup="searchResident('${id}')" autocomplete="off"><div id="${id}-suggest" class="suggestion-box"></div></div>${container.children.length>0?`<button class="remove-btn" onclick="this.parentElement.remove()"><i class="fas fa-times"></i></button>`:''}`;
+        div.className = 'party-row mb-2';
+        div.style.cssText = 'flex-direction:column; align-items:stretch; position:relative;';
+        div.innerHTML = `<div style="position:relative;">
+            <input type="text" id="${id}" class="form-control ${type}-input mb-1" placeholder="Search Resident name..." onkeyup="debouncedSearchResident('${id}')" autocomplete="off">
+            <div id="${id}-suggest" class="suggestion-box"></div>
+        </div>
+        <div class="row g-1">
+            <div class="col-8"><input type="text" id="${addrId}" class="${type}-addr-input form-control form-control-sm" placeholder="Address"></div>
+            <div class="col-4"><input type="text" id="${contactId}" class="${type}-contact-input form-control form-control-sm" placeholder="Contact No."></div>
+        </div>
+        ${!isFirst ? '<button class="remove-btn" style="position:absolute;top:2px;right:2px;z-index:5;" onclick="this.closest(\'.party-row\').remove()"><i class="fas fa-times"></i></button>' : ''}`;
         container.appendChild(div);
+    }
+
+    // Debounce helper
+    function debounce(fn, ms) {
+        let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
     }
 
     function searchResident(inputId) {
         const input = document.getElementById(inputId);
         const box = document.getElementById(inputId + '-suggest');
         const val = input.value.toLowerCase();
-        if(val.length < 2) { box.style.display = 'none'; return; }
-        const matches = residentDB.filter(r => !r.isDead && (r.last + ' ' + r.first).toLowerCase().includes(val)).slice(0,5);
+        if (val.length < 2) { box.style.display = 'none'; return; }
+        const residentDB = getResidentDB(); // always fresh
+        const matches = residentDB.filter(r => !r.isDead && (r.last + ' ' + r.first).toLowerCase().includes(val)).slice(0, 8);
         box.innerHTML = '';
-        if(matches.length === 0) { box.style.display = 'none'; }
-        else { matches.forEach(m => { const item = document.createElement('div'); item.className = 'suggestion-item'; item.innerHTML = `<strong>${m.last}, ${m.first}</strong> <small>(${m.address||''})</small>`; item.onclick = () => { input.value = `${m.last}, ${m.first}`; box.style.display = 'none'; }; box.appendChild(item); }); box.style.display = 'block'; }
+        if (matches.length === 0) { box.style.display = 'none'; }
+        else {
+            matches.forEach(m => {
+                const item = document.createElement('div');
+                item.className = 'suggestion-item';
+                item.innerHTML = `<strong>${m.last}, ${m.first}</strong> <small>${m.hh_name || m.address || ''}</small>`;
+                item.onclick = () => { input.value = `${m.last}, ${m.first}`; box.style.display = 'none'; };
+                box.appendChild(item);
+            });
+            box.style.display = 'block';
+        }
     }
+    const debouncedSearchResident = debounce(searchResident, 250);
 
     function checkDuplicateParties(comps, resps) {
         const nc = comps.map(n => n.trim().toUpperCase());
@@ -634,19 +700,25 @@
         const date = document.getElementById('nc-date').value;
         const nature = document.getElementById('nc-nature').value;
         let comps = []; document.querySelectorAll('.complainant-input').forEach(i => { if(i.value) comps.push(i.value); });
+        let compAddrs = []; document.querySelectorAll('.complainant-addr-input').forEach(i => compAddrs.push(i.value||''));
+        let compContacts = []; document.querySelectorAll('.complainant-contact-input').forEach(i => compContacts.push(i.value||''));
         let resps = []; document.querySelectorAll('.respondent-input').forEach(i => { if(i.value) resps.push(i.value); });
+        let respAddrs = []; document.querySelectorAll('.respondent-addr-input').forEach(i => respAddrs.push(i.value||''));
+        let respContacts = []; document.querySelectorAll('.respondent-contact-input').forEach(i => respContacts.push(i.value||''));
         if(!date || !nature) return showAlert('Please fill Date and Nature', 'warning');
         if(comps.length === 0 || resps.length === 0) return showAlert('Add at least 1 Complainant and 1 Respondent', 'warning');
         const duplicate = checkDuplicateParties(comps, resps);
         if(duplicate) return showAlert(`VALIDATION ERROR: ${duplicate} cannot be both Complainant and Respondent`, 'error');
         if(!nature.includes('Land Dispute')) {
-            const validResidents = new Set(residentDB.map(r => `${r.last}, ${r.first}`.toUpperCase()));
+            const validResidents = new Set(getResidentDB().map(r => `${r.last}, ${r.first}`.toUpperCase()));
             if(!resps.some(n => validResidents.has(n.toUpperCase()))) return showAlert('VALIDATION FAILED: At least one Respondent must be a resident.', 'error');
         }
         const newCase = {
             id: Date.now().toString(), caseNo: document.getElementById('nc-no').value, date, time: document.getElementById('nc-time').value,
             nature, reason: document.getElementById('nc-reason').value, location: document.getElementById('nc-loc').value,
-            complainants: comps, respondents: resps, complaint: document.getElementById('nc-complaint').value, prayer: document.getElementById('nc-prayer').value,
+            complainants: comps, complainantAddrs: compAddrs, complainantContacts: compContacts,
+            respondents: resps, respondentAddrs: respAddrs, respondentContacts: respContacts,
+            complaint: document.getElementById('nc-complaint').value, prayer: document.getElementById('nc-prayer').value,
             status: 'Mediation', history: [{ date: new Date().toLocaleString(), title: 'Case Filed', desc: 'Case received and recorded.' }],
             hearings: [], pangkat: { active: false, members: [], chairman: '', secretary: '', hearings: [], noticeDate: '', constitutedDate: '', extendedDate: '' },
             settlements: [], reSummonCount: 0, reNoticeCount: 0
@@ -1124,10 +1196,9 @@
         const c = casesDB.find(x => x.id === document.getElementById('manage-id').value);
         const h = type === 'mediation' ? c.hearings[idx] : c.pangkat.hearings[idx];
         const chairman = type === 'mediation' ? getLuponChairman() : c.pangkat.chairman;
-        const pOC = rbiSettings.city ? `City of ${rbiSettings.city}` : `Province of ${rbiSettings.province||'________'}`;
         const clList = c.complainants.map(n => `<div style="border-bottom:1px solid black;">${n}</div>`).join('');
         const rlList = c.respondents.map(n => `<div style="border-bottom:1px solid black;">${n}</div>`).join('');
-        const content = `<div style="text-align:center;margin-bottom:20px;">Republic of the Philippines<br>${pOC}<br>Municipality of ${rbiSettings.municipality||'________'}<br><strong>Barangay ${rbiSettings.barangay||'________'}</strong></div><div style="text-align:center;margin-bottom:30px;"><strong>OFFICE OF THE LUPONG TAGAPAMAYAPA</strong></div><table width="100%" style="margin-bottom:20px;"><tr><td width="45%" valign="top">${clList}<div style="text-align:center;font-size:0.85em;margin-top:5px;">Complainant/s</div></td><td width="10%" align="center"></td><td width="45%" valign="top"><strong>Barangay Case No.:</strong> ${c.caseNo}<br><strong>For:</strong> ${c.nature}</td></tr><tr><td colspan="3" align="center" style="padding:10px 0;"><strong>- against -</strong></td></tr><tr><td colspan="3" valign="top">${rlList}<div style="text-align:center;font-size:0.85em;margin-top:5px;">Respondent/s</div></td></tr></table><h3 style="text-align:center;text-decoration:underline;margin:30px 0 20px 0;">AMICABLE SETTLEMENT</h3><p style="text-align:justify;line-height:1.8;">We, complainant/s and respondent/s in the above-captioned case, do hereby agree to settle our dispute as follows:</p><p style="padding:20px;border:1px solid #000;background:#f9f9f9;white-space:pre-wrap;line-height:1.8;text-align:justify;margin:20px 0;">${h.settlement.terms}</p><p style="text-align:justify;line-height:1.8;margin:20px 0;">and bind ourselves to comply honestly and faithfully with the above terms of settlement.</p><p>Entered this ________ day of __________________, 20______.</p><br><br><table width="100%" style="margin:30px 0;"><tr><td width="45%" align="center"><div style="border-bottom:1px solid black;width:200px;margin:0 auto 5px;"></div>Complainant/s</td><td width="10%"></td><td width="45%" align="center"><div style="border-bottom:1px solid black;width:200px;margin:0 auto 5px;"></div>Respondent/s</td></tr></table><br><br><div style="border-top:2px solid black;padding-top:20px;margin-top:40px;"><p style="text-align:center;margin-bottom:30px;"><strong>ATTESTATION</strong></p><p style="text-align:justify;line-height:1.8;">Duly noted and voluntarily submitted this settlement for my approval and I hereby make it part of the official records.</p><br><br><div style="text-align:center;"><div style="border-bottom:1px solid black;width:250px;margin:0 auto 5px;font-weight:bold;">${chairman}</div>Punong Barangay/Lupon Chairman</div></div>`;
+        const content = `<div style="text-align:center;margin-bottom:20px;">${getKPHeader()}</div><div style="text-align:center;margin-bottom:30px;"><strong>OFFICE OF THE LUPONG TAGAPAMAYAPA</strong></div><table width="100%" style="margin-bottom:20px;"><tr><td width="45%" valign="top">${clList}<div style="text-align:center;font-size:0.85em;margin-top:5px;">Complainant/s</div></td><td width="10%" align="center"></td><td width="45%" valign="top"><strong>Barangay Case No.:</strong> ${c.caseNo}<br><strong>For:</strong> ${c.nature}</td></tr><tr><td colspan="3" align="center" style="padding:10px 0;"><strong>- against -</strong></td></tr><tr><td colspan="3" valign="top">${rlList}<div style="text-align:center;font-size:0.85em;margin-top:5px;">Respondent/s</div></td></tr></table><h3 style="text-align:center;text-decoration:underline;margin:30px 0 20px 0;">AMICABLE SETTLEMENT</h3><p style="text-align:justify;line-height:1.8;">We, complainant/s and respondent/s in the above-captioned case, do hereby agree to settle our dispute as follows:</p><p style="padding:20px;border:1px solid #000;background:#f9f9f9;white-space:pre-wrap;line-height:1.8;text-align:justify;margin:20px 0;">${h.settlement.terms}</p><p style="text-align:justify;line-height:1.8;margin:20px 0;">and bind ourselves to comply honestly and faithfully with the above terms of settlement.</p><p>Entered this ________ day of __________________, 20______.</p><br><br><table width="100%" style="margin:30px 0;"><tr><td width="45%" align="center"><div style="border-bottom:1px solid black;width:200px;margin:0 auto 5px;"></div>Complainant/s</td><td width="10%"></td><td width="45%" align="center"><div style="border-bottom:1px solid black;width:200px;margin:0 auto 5px;"></div>Respondent/s</td></tr></table><br><br><div style="border-top:2px solid black;padding-top:20px;margin-top:40px;"><p style="text-align:center;margin-bottom:30px;"><strong>ATTESTATION</strong></p><p style="text-align:justify;line-height:1.8;">Duly noted and voluntarily submitted this settlement for my approval and I hereby make it part of the official records.</p><br><br><div style="text-align:center;"><div style="border-bottom:1px solid black;width:250px;margin:0 auto 5px;font-weight:bold;">${chairman}</div>Punong Barangay/Lupon Chairman</div></div>`;
         const win = window.open('','','width=850,height=1100');
         win.document.write(`<html><head><title>Settlement</title><style>@page{margin:1in;}body{font-family:'Times New Roman',serif;padding:0;margin:0;line-height:1.5;font-size:12pt;}</style></head><body>${content}<script>window.onload=()=>window.print();<\/script></body></html>`);
         win.document.close();
@@ -1174,20 +1245,47 @@
 
     function printForm7() {
         const c = casesDB.find(x => x.id === document.getElementById('manage-id').value);
-        const clList = c.complainants.map(n => `<div style="border-bottom:1px solid black">${n}</div>`).join('');
-        const rlList = c.respondents.map(n => `<div style="border-bottom:1px solid black">${n}</div>`).join('');
-        printTemplateCustomParties(c, clList, rlList, 'KP FORM 7: COMPLAINT', `<p>I/WE hereby complain against above named respondent/s:</p><p style="padding:10px;border:1px dashed #ccc;background:#f9f9f9;white-space:pre-wrap;">${c.complaint}</p><p>THEREFORE, I/WE pray:</p><p style="padding:10px;border:1px dashed #ccc;background:#f9f9f9;white-space:pre-wrap;">${c.prayer}</p><p>Made this ${new Date(c.date).toLocaleDateString()}.</p>`, '', `<div style="border-top:1px solid black;margin-top:20px;padding-top:5px;">Received and filed this ________ day of __________, 20__.<br><br><div style="float:right;text-align:center;"><div style="border-bottom:1px solid black;width:200px;font-weight:bold;">${getLuponChairman()}</div><strong>Punong Barangay / Lupon Chairman</strong></div></div>`);
+        const addrs = c.complainantAddrs || c.complainants.map(()=>'');
+        const contacts = c.complainantContacts || c.complainants.map(()=>'');
+        const clList = c.complainants.map((n,i) => `<div style="border-bottom:1px solid black;margin-bottom:4px;">${n}${addrs[i]?'<br><small style="color:#555;">Address: '+addrs[i]+'</small>':''}${contacts[i]?'<br><small style="color:#555;">Contact: '+contacts[i]+'</small>':''}</div>`).join('');
+        const rAddrs = c.respondentAddrs || c.respondents.map(()=>'');
+        const rContacts = c.respondentContacts || c.respondents.map(()=>'');
+        const rlList = c.respondents.map((n,i) => `<div style="border-bottom:1px solid black;margin-bottom:4px;">${n}${rAddrs[i]?'<br><small style="color:#555;">Address: '+rAddrs[i]+'</small>':''}${rContacts[i]?'<br><small style="color:#555;">Contact: '+rContacts[i]+'</small>':''}</div>`).join('');
+        const compSigs = c.complainants.map(n => `<div style="display:inline-block;width:${Math.floor(90/c.complainants.length)}%;text-align:center;margin-right:5px;"><div style="border-bottom:1px solid black;margin-bottom:3px;min-height:30px;"></div><strong>${n}</strong><br><small>Signature over Printed Name</small></div>`).join('');
+        printTemplateCustomParties(c, clList, rlList, 'KP FORM 7: COMPLAINT', `<p>I/WE hereby complain against above named respondent/s fo violating my/our rights and interest in the following manner </p><p style="padding:10px;border:1px dashed #ccc;background:#f9f9f9;white-space:pre-wrap;">${c.complaint}</p><p>THEREFORE, I/WE pray that the following relief/s be granted to me/us in accordance with law and/ or equity.:</p><p style="padding:10px;border:1px dashed #ccc;background:#f9f9f9;white-space:pre-wrap;">${c.prayer}</p><p>Made this ${new Date(c.date).toLocaleDateString()}.</p><br><div style="margin:20px 0;">${compSigs}</div>`, '', `<div style="border-top:1px solid black;margin-top:20px;padding-top:5px;">Received and filed this ________ day of __________, 20__.<br><br><div style="float:right;text-align:center;"><div style="border-bottom:1px solid black;width:200px;font-weight:bold;">${getLuponChairman()}</div><strong>Punong Barangay / Lupon Chairman</strong></div><div style="clear:both;"></div></div>`);
     }
 
     function printSummons() {
         const c = casesDB.find(x => x.id === document.getElementById('manage-id').value);
         if(!c.hearings.length) return showAlert('Schedule a hearing first', 'warning');
         const h = c.hearings[c.hearings.length-1];
-        const clList = c.complainants.map(n => `<div style="border-bottom:1px solid black">${n}</div>`).join('');
-        const rlList = c.respondents.map(n => `<div style="border-bottom:1px solid black">${n}</div>`).join('');
-        const pOC = rbiSettings.city ? `City of ${rbiSettings.city}` : `Province of ${rbiSettings.province||'________'}`;
+        const addrs = c.complainantAddrs || c.complainants.map(()=>'');
+        const contacts = c.complainantContacts || c.complainants.map(()=>'');
+        const rAddrs = c.respondentAddrs || c.respondents.map(()=>'');
+        const rContacts = c.respondentContacts || c.respondents.map(()=>'');
+        const clList = c.complainants.map((n,i) => `<div style="border-bottom:1px solid black;margin-bottom:4px;">${n}${addrs[i]?'<br><small>Address: '+addrs[i]+'</small>':''}${contacts[i]?'<br><small>Contact: '+contacts[i]+'</small>':''}</div>`).join('');
+        const rlList = c.respondents.map((n,i) => `<div style="border-bottom:1px solid black;margin-bottom:4px;">${n}${rAddrs[i]?'<br><small>Address: '+rAddrs[i]+'</small>':''}${rContacts[i]?'<br><small>Contact: '+rContacts[i]+'</small>':''}</div>`).join('');
         const body = `<p>You are hereby summoned to appear before me in person, together with your witnesses, on <strong>${new Date(h.date).toLocaleString()}</strong> at the Barangay Hall, to answer a complaint made against you.</p><p>You are warned: if you refuse or willfully fail to appear, you may be barred from filing any counterclaim.</p>`;
-        const returnService = `<br><br><div style="page-break-before:always;font-family:'Times New Roman',serif;"><div style="text-align:center;">Republic of the Philippines<br>${pOC}<br>Municipality of ${rbiSettings.municipality||'________'}<br><strong>Barangay ${rbiSettings.barangay||'________'}</strong></div><br><h3 style="text-align:center;text-decoration:underline;">OFFICER'S RETURN</h3><br><p>I served this summons upon respondent/s on the ______ day of ______________, 20____, by:</p><br><table width="100%" cellpadding="5"><tr><td width="30%" style="border-bottom:1px solid black;"></td><td width="5%">1.</td><td>handing to him/them said summons in person, or</td></tr><tr><td style="border-bottom:1px solid black;"></td><td>2.</td><td>handing to him/them and he/they refused to receive it, or</td></tr><tr><td style="border-bottom:1px solid black;"></td><td>3.</td><td>leaving at dwelling with __________________________ a person of suitable age, or</td></tr><tr><td style="border-bottom:1px solid black;"></td><td>4.</td><td>leaving at office with __________________________ a competent person in charge.</td></tr></table><br><div style="float:right;width:200px;text-align:center;"><div style="border-bottom:1px solid black;margin-bottom:5px;"></div>Officer</div><div style="clear:both;"></div></div>`;
+        const returnService = `<br><br><div style="page-break-before:always;font-family:'Times New Roman',serif;padding:40px;">
+            <div style="text-align:center;">${getKPHeader()}</div><br>
+            <h3 style="text-align:center;text-decoration:underline;">OFFICER'S RETURN</h3><br>
+            <table width="100%" style="margin-bottom:15px;">
+                <tr>
+                    <td width="50%"><strong>Date Received:</strong> <span style="border-bottom:1px solid black;display:inline-block;width:160px;">&nbsp;</span></td>
+                    <td width="50%"><strong>Time Received:</strong> <span style="border-bottom:1px solid black;display:inline-block;width:160px;">&nbsp;</span></td>
+                </tr>
+            </table>
+            <p>I served this summons upon respondent/s on the ______ day of ______________, 20____, by:</p><br>
+            <table width="100%" cellpadding="5">
+                <tr><td width="30%" style="border-bottom:1px solid black;"></td><td width="5%">1.</td><td>handing to him/them said summons in person, or</td></tr>
+                <tr><td style="border-bottom:1px solid black;"></td><td>2.</td><td>handing to him/them and he/they refused to receive it, or</td></tr>
+                <tr><td style="border-bottom:1px solid black;"></td><td>3.</td><td>leaving at dwelling with __________________________ a person of suitable age, or</td></tr>
+                <tr><td style="border-bottom:1px solid black;"></td><td>4.</td><td>leaving at office with __________________________ a competent person in charge.</td></tr>
+            </table>
+            <br>
+            <div style="float:right;width:200px;text-align:center;"><div style="border-bottom:1px solid black;margin-bottom:5px;"></div>Officer</div>
+            <div style="clear:both;"></div>
+        </div>`;
         printTemplateCustomParties(c, clList, rlList, 'KP FORM 9: SUMMONS', body, returnService, `<div style="margin-top:50px;float:right;text-align:center"><div style="border-bottom:1px solid black;width:200px;font-weight:bold">${getLuponChairman()}</div><strong>Punong Barangay / Lupon Chairman</strong></div>`);
     }
 
@@ -1195,7 +1293,23 @@
         const c = casesDB.find(x => x.id === document.getElementById('manage-id').value);
         if(!c.hearings.length) return showAlert('Schedule a hearing first', 'warning');
         const h = c.hearings[c.hearings.length-1];
-        printTemplate(c, 'KP FORM 8: NOTICE OF HEARING', `<p>You are hereby required to appear before me on <strong>${new Date(h.date).toLocaleString()}</strong> at the Barangay Hall for the hearing of your complaint.</p>`, '', `<div style="margin-top:50px;float:right;text-align:center"><div style="border-bottom:1px solid black;width:200px;font-weight:bold">${getLuponChairman()}</div><strong>Punong Barangay / Lupon Chairman</strong></div>`);
+        const receivedBySection = `<div style="margin-top:60px;border-top:2px solid black;padding-top:15px;">
+            <p style="font-weight:bold;margin-bottom:20px;">RECEIVED BY / ACKNOWLEDGMENT OF RECEIPT:</p>
+            <table width="100%" style="margin-top:10px;">
+                <tr>
+                    <td width="45%" style="text-align:center;vertical-align:bottom;">
+                        <div style="border-bottom:1px solid black;min-height:35px;margin-bottom:4px;"></div>
+                        <strong>Signature over Printed Name</strong><br><small>Complainant / Authorized Representative</small>
+                    </td>
+                    <td width="10%"></td>
+                    <td width="45%">
+                        Date Received: <div style="border-bottom:1px solid black;margin-top:5px;margin-bottom:3px;"></div>
+                        Time Received: <div style="border-bottom:1px solid black;margin-top:5px;"></div>
+                    </td>
+                </tr>
+            </table>
+        </div>`;
+        printTemplate(c, 'KP FORM 8: NOTICE OF HEARING', `<p>You are hereby required to appear before me on <strong>${new Date(h.date).toLocaleString()}</strong> at the Barangay Hall for the hearing of your complaint.</p>`, receivedBySection, `<div style="margin-top:50px;float:right;text-align:center"><div style="border-bottom:1px solid black;width:200px;font-weight:bold">${getLuponChairman()}</div><strong>Punong Barangay / Lupon Chairman</strong></div>`);
     }
 
     function printForm10() {
@@ -1223,7 +1337,6 @@
     // ============================================================
     function printCFA20A() {
         const c = casesDB.find(x => x.id === document.getElementById('manage-id').value);
-        const pOC = rbiSettings.city ? `City of ${rbiSettings.city}` : `Province of ${rbiSettings.province||'________'}`;
         const clList = c.complainants.map(n => `<div style="border-bottom:1px solid black;margin-bottom:3px;">${n}</div>`).join('');
         const rlList = c.respondents.map(n => `<div style="border-bottom:1px solid black;margin-bottom:3px;">${n}</div>`).join('');
         const constitutedDate = c.pangkat.constitutedDate ? new Date(c.pangkat.constitutedDate) : new Date();
@@ -1245,10 +1358,7 @@
 </head>
 <body>
 <div class="center" style="margin-bottom:15px;">
-  Republic of the Philippines<br>
-  ${pOC}<br>
-  Municipality of ${rbiSettings.municipality||'________'}<br>
-  <strong>Barangay ${rbiSettings.barangay||'________'}</strong>
+  ${getKPHeader()}
 </div>
 <div class="center" style="margin-bottom:20px;"><strong>OFFICE OF THE LUPONG TAGAPAMAYAPA</strong></div>
 
@@ -1364,9 +1474,8 @@
     }
 
     function printTemplateCustomParties(c, complainantsHTML, respondentsHTML, title, body, extra, preSig) {
-        const pOC = rbiSettings.city ? `City of ${rbiSettings.city}` : `Province of ${rbiSettings.province||'________'}`;
         const win = window.open('','','width=850,height=1100');
-        win.document.write(`<html><head><title>${title}</title><style>body{font-family:'Times New Roman',serif;padding:40px;line-height:1.5;}.center{text-align:center;}</style></head><body><div class="center">Republic of the Philippines<br>${pOC}<br>Municipality of ${rbiSettings.municipality||'________'}<br><strong>Barangay ${rbiSettings.barangay||'________'}</strong><br><br><strong>OFFICE OF THE LUPONG TAGAPAMAYAPA</strong></div><br><table width="100%"><tr><td width="45%" valign="top">${complainantsHTML}<div class="center" style="font-size:0.8em">Complainant/s</div><br><div class="center">- against -</div><br>${respondentsHTML}<div class="center" style="font-size:0.8em">Respondent/s</div></td><td width="10%"></td><td width="45%" valign="top"><strong>Case No.:</strong> ${c.caseNo}<br><strong>For:</strong> ${c.nature}</td></tr></table><h3 class="center" style="text-decoration:underline;margin-top:30px;">${title}</h3>${body}${preSig||''}<div style="clear:both;"></div>${extra||''}<script>window.onload=()=>window.print();<\/script></body></html>`);
+        win.document.write(`<html><head><title>${title}</title><style>body{font-family:'Times New Roman',serif;padding:40px;line-height:1.5;}.center{text-align:center;}</style></head><body><div class="center">${getKPHeader()}<br><br><strong>OFFICE OF THE LUPONG TAGAPAMAYAPA</strong></div><br><table width="100%"><tr><td width="45%" valign="top">${complainantsHTML}<div class="center" style="font-size:0.8em">Complainant/s</div><br><div class="center">- against -</div><br>${respondentsHTML}<div class="center" style="font-size:0.8em">Respondent/s</div></td><td width="10%"></td><td width="45%" valign="top"><strong>Case No.:</strong> ${c.caseNo}<br><strong>For:</strong> ${c.nature}</td></tr></table><h3 class="center" style="text-decoration:underline;margin-top:30px;">${title}</h3>${body}${preSig||''}<div style="clear:both;"></div>${extra||''}<script>window.onload=()=>window.print();<\/script></body></html>`);
         win.document.close();
     }
 
